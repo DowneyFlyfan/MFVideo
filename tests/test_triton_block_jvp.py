@@ -1,9 +1,13 @@
 """Correctness + benchmark for the Triton transformer-block JVP
 (Jacobian-vector product).
 
-Reference: pure PyTorch pre-LN block (math SDPA forced) under
-torch.func.jvp in fp32, on the SAME bf16-representable weights.
-Pass threshold: relative Frobenius error <= 3e-2 on y and dy (bf16 run).
+bf16 io: reference is the pure PyTorch pre-LN block (math SDPA forced)
+under torch.func.jvp in fp32, on the SAME bf16-representable weights.
+Pass threshold: relative Frobenius error <= 3e-2 on y and dy.
+
+fp32 io: reference is the same block under torch.func.jvp in fp64
+(falls back to fp32 with a printed note if the fp64 math-SDPA OOMs).
+Thresholds: "fast" variant <= 3e-2, "tf32" variant <= 3e-3.
 
 Run:  /opt/miniconda3/bin/python3 tests/test_triton_block_jvp.py
 """
@@ -81,6 +85,22 @@ def ref_jvp(x, dx, params, n_heads):
     )
 
 
+def ref_jvp_f64(x, dx, params, n_heads):
+    """fp64 reference; falls back to fp32 (with a note) if fp64 OOMs."""
+    p64 = {k: (v.double() if torch.is_tensor(v) else v)
+           for k, v in params.items()}
+    try:
+        y, dy = ref_jvp(x.double(), dx.double(), p64, n_heads)
+        return y, dy, "fp64"
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        p32 = {k: (v.float() if torch.is_tensor(v) else v)
+               for k, v in params.items()}
+        y, dy = ref_jvp(x.float(), dx.float(), p32, n_heads)
+        print("  [fp64 reference OOM -> using fp32 reference]")
+        return y, dy, "fp32"
+
+
 def _err(name, out, ref, rel_tol=3e-2):
     out, ref = out.float(), ref.float()
     max_abs = (out - ref).abs().max().item()
@@ -113,6 +133,30 @@ def test_block_jvp(shape):
     print(f"\nshape (B,S,D,H)={shape}")
     _err("y", y, y_ref)
     _err("dy", dy, dy_ref)
+
+
+@pytest.mark.parametrize("shape", CORRECTNESS_SHAPES)
+@pytest.mark.parametrize("variant,tol", [("fast", 3e-2), ("tf32", 3e-3)])
+def test_block_jvp_fp32(shape, variant, tol):
+    torch.manual_seed(0)
+    B, S, D, H = shape
+    dev = "cuda"
+    params = init_block_params(D, H, device=dev, dtype=torch.float32, seed=0)
+
+    x = torch.randn(B, S, D, device=dev, dtype=torch.float32)
+    dx = torch.randn(B, S, D, device=dev, dtype=torch.float32)
+
+    y, dy = triton_block_jvp(x, dx, params, eps=EPS, variant=variant)
+    assert y.dtype == torch.float32 and dy.dtype == torch.float32
+
+    y_ref, dy_ref, ref_prec = ref_jvp_f64(x, dx, params, H)
+
+    print(f"\nfp32 io, variant={variant}, ref={ref_prec}, "
+          f"shape (B,S,D,H)={shape}")
+    _err("y", y.double(), y_ref.double(), rel_tol=tol)
+    _err("dy", dy.double(), dy_ref.double(), rel_tol=tol)
+    del y_ref, dy_ref
+    torch.cuda.empty_cache()
 
 
 def test_module_matches_functional():
@@ -197,9 +241,73 @@ def benchmark():
     return rows
 
 
+def benchmark_fp32():
+    dev = "cuda"
+    tf32_flag = torch.backends.cuda.matmul.allow_tf32
+    fp32_prec = getattr(torch.backends.cuda.matmul, "fp32_precision", "n/a")
+    print(f"\n=== Benchmark: fp32 io, CUDA events, 30 iters / 5 warmup ===")
+    print(f"baseline torch defaults: matmul.allow_tf32={tf32_flag}, "
+          f"matmul.fp32_precision={fp32_prec} (NOT changed for baselines)")
+    for B, S, D, H in BENCH_SHAPES:
+        torch.manual_seed(0)
+        params = init_block_params(D, H, device=dev, dtype=torch.float32)
+        mod_fast = TritonBlockJVP(D, H, device=dev, dtype=torch.float32,
+                                  variant="fast")
+        mod_fast.load_params(params)
+        mod_tf32 = TritonBlockJVP(D, H, device=dev, dtype=torch.float32,
+                                  variant="tf32")
+        mod_tf32.load_params(params)
+        x = torch.randn(B, S, D, device=dev, dtype=torch.float32)
+        dx = torch.randn(B, S, D, device=dev, dtype=torch.float32)
+
+        with torch.no_grad():
+            t_fast = _time_cuda(lambda: mod_fast(x, dx))
+            t_tf32 = _time_cuda(lambda: mod_tf32(x, dx))
+
+        def baseline():
+            with torch.no_grad():
+                return ref_jvp(x, dx, params, H)
+
+        try:
+            t_ref = _time_cuda(baseline)
+            ref_note = f"{t_ref:8.3f}"
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            t_ref = float("nan")
+            ref_note = "OOM"
+
+        try:
+            compiled = torch.compile(
+                lambda a, b: ref_jvp(a, b, params, H), dynamic=False
+            )
+            with torch.no_grad():
+                t_comp = _time_cuda(lambda: compiled(x, dx))
+            comp_note = f"{t_comp:8.3f}"
+        except Exception as e:  # noqa: BLE001
+            t_comp = float("nan")
+            comp_note = f"FAILED ({type(e).__name__})"
+            torch.cuda.empty_cache()
+
+        print(
+            f"(B={B}, S={S}, D={D}, H={H})  "
+            f"fast={t_fast:8.3f} ms  tf32={t_tf32:8.3f} ms  "
+            f"eager={ref_note} ms  compiled={comp_note} ms\n"
+            f"    fast: {t_ref / t_fast:6.2f}x vs eager, "
+            f"{t_comp / t_fast:6.2f}x vs compiled | "
+            f"tf32: {t_ref / t_tf32:6.2f}x vs eager, "
+            f"{t_comp / t_tf32:6.2f}x vs compiled"
+        )
+        del params, mod_fast, mod_tf32
+        torch.cuda.empty_cache()
+
+
 if __name__ == "__main__":
     for shape in CORRECTNESS_SHAPES:
         test_block_jvp(shape)
+    for shape in CORRECTNESS_SHAPES:
+        for variant, tol in [("fast", 3e-2), ("tf32", 3e-3)]:
+            test_block_jvp_fp32(shape, variant, tol)
     test_module_matches_functional()
     print("\nAll correctness tests passed.")
     benchmark()
+    benchmark_fp32()

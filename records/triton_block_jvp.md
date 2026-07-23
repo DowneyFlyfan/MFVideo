@@ -109,4 +109,45 @@ $$
 
 - Remaining wall: the flash JVP kernel holds 62 percent of the runtime at 138 TFLOPS with fp16 tile accumulation; the next factor would need fp8 score/value dots (151 TFLOPS ceiling gives at most 9 percent) or smaller-precision softmax, both of which spend accuracy for little return, and the fp8 GEMMs already run at 0.19-0.49 ms against a 210 TFLOPS effective rate
 
+## fp32 io Mode
+
+- API (application programming interface): `triton_block_jvp(x, dx, params, eps, variant)` dispatches on the input dtype — bf16/fp16 inputs take the original path unchanged, fp32 inputs (with fp32-stored params) return fp32 (y, dy) with the internals selected by `variant`: \textbf{fast} (default) or \textbf{tf32}; `TritonBlockJVP(..., dtype=torch.float32, variant=...)` exposes the same choice, and all pre-existing bf16 call sites keep working without modification
+
+- \textbf{fast} variant internals (io is fp32 but compute is NOT): parameters are stored fp32 and amax-quantized once to fp8 (float8_e4m3fn) for the four linears; RMSNorm1/RMSNorm2 read fp32 and write fp8 directly (the downcast is fused into the existing kernels via a CLAMP constexpr, no separate cast passes); the QKV `torch._scaled_mm` emits fp16 and attention runs the fp16-accumulate flash JVP kernel unchanged; the out, gate-up, and down `torch._scaled_mm` calls emit fp32 directly (out_dtype=fp32 works on sm_120), so the residual stream, the SwiGLU input, and both final outputs are fp32 — accuracy is therefore fp8/fp16-limited, identical in kind to the bf16 path
+
+- \textbf{tf32} variant internals: every buffer is fp32; the same flash/RMSNorm/SwiGLU Triton kernels run with fp32 operands and every `tl.dot` at tf32 inner precision, and the four linears run through cuBLAS with tf32 enabled locally inside the call (`torch.backends.cuda.matmul.fp32_precision` set to "tf32" and restored in a finally block, so the caller's global setting is never changed); no fp8 or fp16 anywhere
+
+- fp32 operands double the k/dk/v/dv tile footprint in the flash kernel, so the tf32 path uses its own autotune config space — measured against the 101376-byte shared-memory limit of this sm_120 part, only {(64, 64) stages 1, (64, 32) stages 2, (32, 32) stages 2-3} fit (every fp16-path config needs 114688 to 360448 bytes with fp32 operands); implemented as two autotuner entry points over one kernel body parameterized by FP16_MMA/CLAMP constexpr flags
+
+## fp32 Correctness
+
+- Reference: the same eager block under `torch.func.jvp` in \textbf{fp64} (math SDPA), which fit in memory at every correctness shape, so no fp32-reference fallback was needed; thresholds: fast variant relative Frobenius error $\le 3 \times 10^{-2}$, tf32 variant $\le 3 \times 10^{-3}$
+
+| Shape (B, S, D, H) | Variant | y rel Fro | y max abs | dy rel Fro | dy max abs |
+|---|---|---|---|---|---|
+| (2, 512, 768, 12) | fast | 9.818e-03 | 4.826e-02 | 1.400e-02 | 7.302e-02 |
+| (1, 1000, 768, 12) | fast | 9.822e-03 | 4.840e-02 | 1.400e-02 | 7.144e-02 |
+| (2, 4096, 512, 8) | fast | 5.362e-03 | 3.101e-02 | 7.692e-03 | 4.336e-02 |
+| (2, 512, 768, 12) | tf32 | 7.785e-05 | 4.050e-04 | 1.111e-04 | 5.524e-04 |
+| (1, 1000, 768, 12) | tf32 | 7.735e-05 | 3.787e-04 | 1.105e-04 | 6.446e-04 |
+| (2, 4096, 512, 8) | tf32 | 4.214e-05 | 2.182e-04 | 6.036e-05 | 3.297e-04 |
+
+- The tf32 variant sits 27x under its 3e-3 threshold; the fast variant error matches the bf16-path level (fp8 weight quantization dominates); all 10 pytest cases pass (3 bf16 shapes unchanged, 6 fp32 shape-variant combinations, 1 module-versus-functional bit-exactness)
+
+## fp32 Benchmark
+
+- fp32 io, CUDA events, 30 iterations after 5 warmup; baselines are the eager fp32 block under `torch.func.jvp` (math SDPA) and `torch.compile` of the same closure, both run at torch DEFAULTS: `torch.backends.cuda.matmul.allow_tf32 = False` and `torch.backends.cuda.matmul.fp32_precision = "none"` — tf32 is NOT enabled for either baseline (torch.compile even warns that tf32 is available but unused)
+
+| Shape (B, S, D, H) | fast (ms) | tf32 (ms) | Eager (ms) | Compiled (ms) | fast/eager | fast/comp | tf32/eager | tf32/comp |
+|---|---|---|---|---|---|---|---|---|
+| (2, 1024, 768, 12) | 0.584 | 2.057 | 8.850 | 5.846 | 15.2x | 10.0x | 4.3x | 2.8x |
+| (2, 4096, 768, 12) | 4.006 | 13.795 | 87.451 | 44.432 | 21.8x | 11.1x | 6.3x | 3.2x |
+| (1, 8192, 768, 12) | 6.169 | 21.480 | OOM | 72.910 | n/a | 11.8x | n/a | 3.4x |
+
+- The fast variant clears the 20x goal at (2, 4096, 768, 12): 21.8x versus the fp32 eager baseline; the tf32 variant does NOT reach 20x (6.3x) — its flash kernel is capped by the small shared-memory-viable tiles (single-stage pipelining at (64, 64)) and the tf32 MMA rate, so the higher accuracy costs 3.4x over the fast variant
+
+- fp32 io costs the fast path 0.43 ms over bf16 io at (2, 4096, 768, 12) (4.006 versus 3.572 ms in the same run): the extra traffic is the fp32 residual stream, the fp32 gate/up GEMM output read by SwiGLU, and the fp32 final writes
+
+- (1, 8192, 768, 12) eager fp32 baseline: CUDA out of memory on the 16 GB card, the same failure mode as the bf16 eager baseline at that shape
+
 - Repro: `/opt/miniconda3/bin/python3 tests/test_triton_block_jvp.py` (correctness then benchmark), or `python3 -m pytest tests/test_triton_block_jvp.py` for correctness only
