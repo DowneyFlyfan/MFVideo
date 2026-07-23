@@ -7,7 +7,7 @@ Pass threshold: relative Frobenius error <= 3e-2 on y and dy.
 
 fp32 io: reference is the same block under torch.func.jvp in fp64
 (falls back to fp32 with a printed note if the fp64 math-SDPA OOMs).
-Thresholds: "fast" variant <= 3e-2, "tf32" variant <= 3e-3.
+Thresholds: "fast" variant <= 3e-2, "hp" and "tf32" variants <= 3e-3.
 
 Run:  /opt/miniconda3/bin/python3 tests/test_triton_block_jvp.py
 """
@@ -136,7 +136,8 @@ def test_block_jvp(shape):
 
 
 @pytest.mark.parametrize("shape", CORRECTNESS_SHAPES)
-@pytest.mark.parametrize("variant,tol", [("fast", 3e-2), ("tf32", 3e-3)])
+@pytest.mark.parametrize(
+    "variant,tol", [("fast", 3e-2), ("hp", 3e-3), ("tf32", 3e-3)])
 def test_block_jvp_fp32(shape, variant, tol):
     torch.manual_seed(0)
     B, S, D, H = shape
@@ -254,6 +255,9 @@ def benchmark_fp32():
         mod_fast = TritonBlockJVP(D, H, device=dev, dtype=torch.float32,
                                   variant="fast")
         mod_fast.load_params(params)
+        mod_hp = TritonBlockJVP(D, H, device=dev, dtype=torch.float32,
+                                variant="hp")
+        mod_hp.load_params(params)
         mod_tf32 = TritonBlockJVP(D, H, device=dev, dtype=torch.float32,
                                   variant="tf32")
         mod_tf32.load_params(params)
@@ -262,6 +266,7 @@ def benchmark_fp32():
 
         with torch.no_grad():
             t_fast = _time_cuda(lambda: mod_fast(x, dx))
+            t_hp = _time_cuda(lambda: mod_hp(x, dx))
             t_tf32 = _time_cuda(lambda: mod_tf32(x, dx))
 
         def baseline():
@@ -275,6 +280,20 @@ def benchmark_fp32():
             torch.cuda.empty_cache()
             t_ref = float("nan")
             ref_note = "OOM"
+
+        # tf32-ENABLED eager baseline (the strong baseline for hp/tf32)
+        mm = torch.backends.cuda.matmul
+        old_prec = mm.fp32_precision
+        mm.fp32_precision = "tf32"
+        try:
+            t_ref_tf32 = _time_cuda(baseline)
+            ref_tf32_note = f"{t_ref_tf32:8.3f}"
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            t_ref_tf32 = float("nan")
+            ref_tf32_note = "OOM"
+        finally:
+            mm.fp32_precision = old_prec
 
         try:
             compiled = torch.compile(
@@ -290,14 +309,17 @@ def benchmark_fp32():
 
         print(
             f"(B={B}, S={S}, D={D}, H={H})  "
-            f"fast={t_fast:8.3f} ms  tf32={t_tf32:8.3f} ms  "
-            f"eager={ref_note} ms  compiled={comp_note} ms\n"
+            f"fast={t_fast:8.3f} ms  hp={t_hp:8.3f} ms  "
+            f"tf32={t_tf32:8.3f} ms\n"
+            f"    eager={ref_note} ms  eager_tf32on={ref_tf32_note} ms  "
+            f"compiled={comp_note} ms\n"
             f"    fast: {t_ref / t_fast:6.2f}x vs eager, "
             f"{t_comp / t_fast:6.2f}x vs compiled | "
-            f"tf32: {t_ref / t_tf32:6.2f}x vs eager, "
-            f"{t_comp / t_tf32:6.2f}x vs compiled"
+            f"hp: {t_ref_tf32 / t_hp:6.2f}x vs eager_tf32on, "
+            f"{t_comp / t_hp:6.2f}x vs compiled | "
+            f"tf32: {t_ref_tf32 / t_tf32:6.2f}x vs eager_tf32on"
         )
-        del params, mod_fast, mod_tf32
+        del params, mod_fast, mod_hp, mod_tf32
         torch.cuda.empty_cache()
 
 
@@ -305,7 +327,7 @@ if __name__ == "__main__":
     for shape in CORRECTNESS_SHAPES:
         test_block_jvp(shape)
     for shape in CORRECTNESS_SHAPES:
-        for variant, tol in [("fast", 3e-2), ("tf32", 3e-3)]:
+        for variant, tol in [("fast", 3e-2), ("hp", 3e-3), ("tf32", 3e-3)]:
             test_block_jvp_fp32(shape, variant, tol)
     test_module_matches_functional()
     print("\nAll correctness tests passed.")

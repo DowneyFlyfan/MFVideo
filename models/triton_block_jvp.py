@@ -25,16 +25,21 @@ Speed path (sm_89+, torch._scaled_mm available):
 All softmax statistics and cross-tile accumulation are fp32.
 
 fp32 io mode (dispatch on input dtype): x/dx/params in fp32, outputs fp32.
-Two variants selected by the `variant` argument:
+Three variants selected by the `variant` argument:
   * "fast" (default): identical internals to the bf16 path — fp8 linears
     and fp16-accumulate attention.  The Triton kernels read fp32 and
     write fp8/fp16 directly (casts fused, no separate cast passes); the
     out/gate-up/down `_scaled_mm` calls emit fp32, so the residual
     stream and both outputs are fp32 end to end.
+  * "hp" (high precision): fp16 weights + fp16 activations, cuBLAS fp16
+    GEMMs (fp32 accumulation), the same fp16-accumulate flash JVP
+    kernel, and an fp32 residual stream.  No fp8 anywhere, so error is
+    fp16-rounding-limited (~1e-4 rel Fro) at near-fast-path speed.
   * "tf32": every `tl.dot` runs on fp32 operands with tf32 inner
     precision, the four linears run through cuBLAS with tf32 enabled
     (enabled locally inside this call only, global setting restored),
-    and every intermediate buffer is fp32 — higher accuracy fallback.
+    and every intermediate buffer is fp32 — fp32-storage fallback
+    (slower than "hp", similar accuracy).
 """
 
 import math
@@ -341,6 +346,72 @@ def _fp8_weight_cache(params, w_gu):
     }
 
 
+def _fp16_weight_cache(params, w_gu):
+    return {
+        "w_qkv": params["w_qkv"].detach().half(),
+        "w_out": params["w_out"].detach().half(),
+        "w_gate_up": w_gu.detach().half(),
+        "w_down": params["w_down"].detach().half(),
+    }
+
+
+def _block_jvp_hp(x, dx, params, eps):
+    """fp32-io high-precision variant: fp16 weights + fp16 activations,
+    cuBLAS fp16 GEMMs, the fp16-accumulate flash JVP kernel, and an fp32
+    residual stream (residual adds and both outputs are fp32).  Error is
+    fp16-rounding-limited (~5e-4 rel Fro), no fp8 anywhere."""
+    B, S, D = x.shape
+    n_heads = params["n_heads"]
+    hd = D // n_heads
+    assert hd * n_heads == D
+    scale = 1.0 / math.sqrt(hd)
+    dev = x.device
+
+    w_gu = params.get("w_gate_up")
+    if w_gu is None:
+        w_gu = torch.cat([params["w_gate"], params["w_up"]], dim=0)
+    f = w_gu.shape[0] // 2
+    w16 = params.get("_fp16")
+    if w16 is None:
+        w16 = _fp16_weight_cache(params, w_gu)
+    M = 2 * B * S
+
+    # ---- RMSNorm1: fp32 in, fp16 out (cast fused into the kernel)
+    xs16 = torch.empty(2 * B, S, D, device=dev, dtype=torch.float16)
+    _rmsnorm_jvp(x, dx, params["w_norm1"], xs16[:B], xs16[B:], eps)
+
+    # ---- QKV projection: one fp16 GEMM on the stacked batch
+    qkv = (xs16.view(M, D) @ w16["w_qkv"].t()).view(2 * B, S, 3, n_heads, hd)
+    q, k, v = qkv[:B, :, 0], qkv[:B, :, 1], qkv[:B, :, 2]
+    dq, dk, dv = qkv[B:, :, 0], qkv[B:, :, 1], qkv[B:, :, 2]
+
+    # ---- fused flash-attention JVP (fp16 io, fp32 softmax statistics)
+    attn16 = torch.empty(2 * B, S, D, device=dev, dtype=torch.float16)
+    _flash_jvp(q, k, v, dq, dk, dv,
+               attn16[:B].view(B, S, n_heads, hd),
+               attn16[B:].view(B, S, n_heads, hd), scale)
+
+    # ---- out projection + residual add into an fp32 residual stream
+    proj = (attn16.view(M, D) @ w16["w_out"].t()).view(2 * B, S, D)
+    res = torch.empty(2 * B, S, D, device=dev, dtype=torch.float32)
+    torch.add(proj[:B], x, out=res[:B])
+    torch.add(proj[B:], dx, out=res[B:])
+
+    # ---- RMSNorm2 (fp32 in, fp16 out, reuse xs16)
+    _rmsnorm_jvp(res[:B], res[B:], params["w_norm2"], xs16[:B], xs16[B:], eps)
+
+    # ---- gate/up projection (fp16 GEMM, fused weight)
+    gu = (xs16.view(M, D) @ w16["w_gate_up"].t()).view(2 * B, S, 2 * f)
+
+    # ---- fused SwiGLU JVP (fp32 math inside, fp16 out)
+    act16 = torch.empty(2 * B, S, f, device=dev, dtype=torch.float16)
+    _swiglu_jvp(gu[:B], gu[B:], act16[:B], act16[B:])
+
+    # ---- down projection + fp32 residual add
+    res += (act16.view(M, f) @ w16["w_down"].t()).view(2 * B, S, D)
+    return res[:B].contiguous(), res[B:].contiguous()
+
+
 def _tf32_on():
     """Enable cuBLAS tf32, returning a restore closure (torch>=2.9 uses
     fp32_precision, allow_tf32 elsewhere)."""
@@ -413,9 +484,11 @@ def triton_block_jvp(x, dx, params, eps: float = 1e-6, variant: str = "fast"):
     x, dx : (B, S, D) bf16/fp16/fp32 CUDA tensors (contiguous).  Params
             must match the input dtype.  With fp32 inputs, `variant`
             selects the internals: "fast" (default; fp8 linears +
-            fp16-accumulate attention, fp32 io) or "tf32" (tf32 dots and
-            cuBLAS tf32 GEMMs everywhere, higher accuracy).  bf16/fp16
-            inputs always take the fast path; `variant` is ignored.
+            fp16-accumulate attention, fp32 io), "hp" (fp16 weights and
+            activations, fp32 residual stream, ~1e-4 rel error), or
+            "tf32" (tf32 dots and cuBLAS tf32 GEMMs everywhere, fp32
+            storage).  bf16/fp16 inputs always take the fast path;
+            `variant` is ignored.
     params: dict with keys w_norm1 (D,), w_qkv (3D, D), w_out (D, D),
             w_norm2 (D,), w_gate (F, D), w_up (F, D), w_down (D, F),
             n_heads (int).  Optional key w_gate_up (2F, D) = cat(gate, up)
@@ -427,6 +500,8 @@ def triton_block_jvp(x, dx, params, eps: float = 1e-6, variant: str = "fast"):
     assert x.is_cuda and x.is_contiguous() and dx.is_contiguous()
     if x.dtype == torch.float32 and variant == "tf32":
         return _block_jvp_tf32(x, dx, params, eps)
+    if x.dtype == torch.float32 and variant == "hp":
+        return _block_jvp_hp(x, dx, params, eps)
     B, S, D = x.shape
     n_heads = params["n_heads"]
     hd = D // n_heads
@@ -511,8 +586,9 @@ def init_block_params(d_model, n_heads, device="cuda", dtype=torch.bfloat16,
 class TritonBlockJVP(nn.Module):
     """Module wrapper holding the block parameters (same init as the
     PyTorch reference).  forward(x, dx) -> (y, dy).  Caches the fused
-    gate/up weight and the fp8-quantized weights across calls.  With
-    fp32 parameters/inputs, `variant` picks "fast" (fp8/fp16 internals)
+    gate/up weight and the fp8/fp16-quantized weights across calls.
+    With fp32 parameters/inputs, `variant` picks "fast" (fp8/fp16
+    internals), "hp" (fp16 weights/activations, fp32 residual stream),
     or "tf32" (tf32 everywhere)."""
 
     def __init__(self, d_model, n_heads, device="cuda",
@@ -527,6 +603,7 @@ class TritonBlockJVP(nn.Module):
             setattr(self, name, nn.Parameter(p[name]))
         self._w_gate_up = None
         self._fp8 = None
+        self._fp16 = None
 
     def load_params(self, params):
         with torch.no_grad():
@@ -535,15 +612,24 @@ class TritonBlockJVP(nn.Module):
                 getattr(self, name).copy_(params[name])
         self._w_gate_up = None
         self._fp8 = None
+        self._fp16 = None
 
     def forward(self, x, dx):
         if self._w_gate_up is None or self._w_gate_up.dtype != x.dtype:
             self._w_gate_up = torch.cat(
                 [self.w_gate.detach(), self.w_up.detach()], dim=0)
             self._fp8 = None
-        need_fp8 = not (x.dtype == torch.float32 and self.variant == "tf32")
+            self._fp16 = None
+        fp32_variant = x.dtype == torch.float32 and self.variant in (
+            "tf32", "hp")
+        need_fp8 = not fp32_variant
         if need_fp8 and self._fp8 is None:
             self._fp8 = _fp8_weight_cache(
+                {"w_qkv": self.w_qkv, "w_out": self.w_out,
+                 "w_down": self.w_down}, self._w_gate_up)
+        need_fp16 = x.dtype == torch.float32 and self.variant == "hp"
+        if need_fp16 and self._fp16 is None:
+            self._fp16 = _fp16_weight_cache(
                 {"w_qkv": self.w_qkv, "w_out": self.w_out,
                  "w_down": self.w_down}, self._w_gate_up)
         params = {
@@ -551,7 +637,8 @@ class TritonBlockJVP(nn.Module):
             "w_out": self.w_out, "w_norm2": self.w_norm2,
             "w_gate": self.w_gate, "w_up": self.w_up,
             "w_down": self.w_down, "w_gate_up": self._w_gate_up,
-            "_fp8": self._fp8, "n_heads": self.n_heads,
+            "_fp8": self._fp8, "_fp16": self._fp16,
+            "n_heads": self.n_heads,
         }
         return triton_block_jvp(x, dx, params, eps=self.eps,
                                 variant=self.variant)
