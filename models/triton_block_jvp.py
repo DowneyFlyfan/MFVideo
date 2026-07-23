@@ -26,11 +26,15 @@ All softmax statistics and cross-tile accumulation are fp32.
 
 fp32 io mode (dispatch on input dtype): x/dx/params in fp32, outputs fp32.
 Three variants selected by the `variant` argument:
-  * "fast" (default): identical internals to the bf16 path — fp8 linears
-    and fp16-accumulate attention.  The Triton kernels read fp32 and
-    write fp8/fp16 directly (casts fused, no separate cast passes); the
-    out/gate-up/down `_scaled_mm` calls emit fp32, so the residual
-    stream and both outputs are fp32 end to end.
+  * "fast" (default): fp8 linears; the QKV GEMM emits fp8 and attention
+    runs all tl.dot ops on fp8 operands with fp16 accumulation (240
+    TFLOPS measured at S=4096 on sm_120).  The out/gate-up/down
+    `_scaled_mm` calls emit fp16; the attention residual add is fused
+    into the RMSNorm2 kernel (fp16 residual stream, norm computed on
+    the pre-rounding fp32 sum) and the final residual add is one fused
+    mixed-dtype torch.add per output, so both outputs are fp32.  For
+    even batch the two batch halves run on two CUDA streams (exact:
+    outputs are bit-identical to single-stream).
   * "hp" (high precision): fp16 weights + fp16 activations, cuBLAS fp16
     GEMMs (fp32 accumulation), the same fp16-accumulate flash JVP
     kernel, and an fp32 residual stream.  No fp8 anywhere, so error is
@@ -123,6 +127,48 @@ def _rmsnorm_jvp(x, dx, w, y, dy, eps):
 
 
 # --------------------------------------------------------------------------
+# Fused residual-add + RMSNorm JVP: res = x + p (written fp32), followed
+# by the RMSNorm JVP of res written in the output dtype (fp8 for the fast
+# path).  Removes the separate residual-add kernels and the extra fp32
+# read of the residual stream.
+# --------------------------------------------------------------------------
+@triton.jit
+def _rmsnorm_res_jvp_kernel(P, DP, X, DX, W, RES, DRES, Y, DY, D, eps,
+                            BLOCK: tl.constexpr, CLAMP: tl.constexpr):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < D
+    p = tl.load(P + row * D + cols, mask=mask, other=0.0).to(tl.float32)
+    dp = tl.load(DP + row * D + cols, mask=mask, other=0.0).to(tl.float32)
+    x = tl.load(X + row * D + cols, mask=mask, other=0.0).to(tl.float32)
+    dx = tl.load(DX + row * D + cols, mask=mask, other=0.0).to(tl.float32)
+    x = x + p
+    dx = dx + dp
+    tl.store(RES + row * D + cols, x.to(RES.dtype.element_ty), mask=mask)
+    tl.store(DRES + row * D + cols, dx.to(DRES.dtype.element_ty), mask=mask)
+    w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+    inv_r = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / D + eps)
+    mxdx = tl.sum(x * dx, axis=0) / D
+    y = w * x * inv_r
+    dy = w * (dx * inv_r - x * (mxdx * inv_r * inv_r * inv_r))
+    if CLAMP:
+        y = tl.clamp(y, -448.0, 448.0)
+        dy = tl.clamp(dy, -448.0, 448.0)
+    tl.store(Y + row * D + cols, y.to(Y.dtype.element_ty), mask=mask)
+    tl.store(DY + row * D + cols, dy.to(DY.dtype.element_ty), mask=mask)
+
+
+def _rmsnorm_res_jvp(p, dp, x, dx, w, res, dres, y, dy, eps):
+    n_rows, d = x.reshape(-1, x.shape[-1]).shape
+    BLOCK = triton.next_power_of_2(d)
+    num_warps = 4 if BLOCK <= 1024 else 8
+    _rmsnorm_res_jvp_kernel[(n_rows,)](
+        p, dp, x, dx, w, res, dres, y, dy, d, eps, BLOCK=BLOCK,
+        num_warps=num_warps, CLAMP=(y.dtype == _FP8),
+    )
+
+
+# --------------------------------------------------------------------------
 # Flash-attention JVP.  Per (m, n) tile, with softmax scale c:
 #   S  = c * Q K^T                    (kept in log2 units for exp2)
 #   dS = c * (dQ K^T + Q dK^T)        (one dot over width 2*hd, joined)
@@ -142,6 +188,25 @@ _FLASH_CONFIGS = [
     triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=3),
+]
+
+# fp8 operands halve the k/dk/v/dv tile footprint versus fp16, so larger
+# tiles and deeper software pipelines (num_stages) fit the 99 KB shared
+# memory of sm_120.
+# Exhaustive manual sweep at (2, 4096, 768, 12): BLOCK_M=128, BLOCK_N=32,
+# 4 warps, 3 stages wins at 240 TFLOPS (narrow key tiles keep 4-warp
+# occupancy while the wide query tile amortizes the k/dk/v/dv loads).
+# BLOCK_M/BLOCK_N stay <= 128 so the EVEN_S=(S % 128 == 0) shortcut in
+# _flash_jvp remains valid for every config.
+_FLASH_CONFIGS_FP8 = [
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_warps=4, num_stages=4),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 32}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=2),
     triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=3),
 ]
 
@@ -239,8 +304,10 @@ def _flash_jvp_kernel_impl(
             v = tl.load(V + kp, mask=mask_n[:, None], other=0.0)
             dv = tl.load(DV + kp, mask=mask_n[:, None], other=0.0)
         if FP16_MMA:
-            pc = p.to(tl.float16)
-            tc = t.to(tl.float16)
+            # cast P/T to the operand dtype of V (fp16, or fp8 when the
+            # whole qkv buffer is fp8) so all dots run at that MMA rate
+            pc = p.to(V.dtype.element_ty)
+            tc = t.to(V.dtype.element_ty)
             o_t = tl.dot(pc, v, out_dtype=tl.float16).to(tl.float32)
             do_t = (tl.dot(tc, v, out_dtype=tl.float16)
                     + tl.dot(pc, dv, out_dtype=tl.float16)).to(tl.float32)
@@ -266,10 +333,12 @@ def _flash_jvp_kernel_impl(
         tl.store(DO + op, do.to(DO.dtype.element_ty), mask=mask_m[:, None])
 
 
-# Two autotuner entry points over the same kernel body: fp16 operands
-# and fp32 (tf32-dot) operands need disjoint tile-config spaces.
+# Three autotuner entry points over the same kernel body: fp16, fp8 and
+# fp32 (tf32-dot) operands need disjoint tile-config spaces.
 _flash_jvp_kernel = triton.autotune(
     configs=_FLASH_CONFIGS, key=["S", "H"])(_flash_jvp_kernel_impl)
+_flash_jvp_kernel_fp8 = triton.autotune(
+    configs=_FLASH_CONFIGS_FP8, key=["S", "H"])(_flash_jvp_kernel_impl)
 _flash_jvp_kernel_fp32 = triton.autotune(
     configs=_FLASH_CONFIGS_FP32, key=["S", "H"])(_flash_jvp_kernel_impl)
 
@@ -278,18 +347,22 @@ def _flash_jvp(q, k, v, dq, dk, dv, o, do, scale):
     B, S, H, hd = q.shape
     assert q.stride() == k.stride() == v.stride() == dq.stride()
     assert q.stride(-1) == 1 and o.stride(-1) == 1
-    fp16 = q.dtype == torch.float16
-    kernel = _flash_jvp_kernel if fp16 else _flash_jvp_kernel_fp32
+    if q.dtype == torch.float16:
+        kernel = _flash_jvp_kernel
+    elif q.dtype == _FP8:
+        kernel = _flash_jvp_kernel_fp8
+    else:
+        kernel = _flash_jvp_kernel_fp32
     grid = lambda meta: (triton.cdiv(S, meta["BLOCK_M"]), B * H)
     kernel[grid](
         q, k, v, dq, dk, dv, o, do,
         q.stride(0), q.stride(1), q.stride(2),
         o.stride(0), o.stride(1), o.stride(2),
         H, S, scale, HEAD_DIM=hd,
-        # 128 is the largest BLOCK_M/BLOCK_N in either autotune space, so
+        # 128 is the largest BLOCK_M/BLOCK_N in every autotune space, so
         # divisibility by 128 implies no bounds masks for any config.
         EVEN_S=(S % 128 == 0),
-        FP16_MMA=fp16,
+        FP16_MMA=(q.dtype != torch.float32),
         CLAMP=(o.dtype == _FP8),
     )
 
@@ -337,6 +410,97 @@ def _swiglu_jvp(gu, dgu, h, dh):
 # --------------------------------------------------------------------------
 # Full block JVP
 # --------------------------------------------------------------------------
+_STREAM_PAIR = {}
+
+
+def _stream_pair(dev):
+    """Two cached side streams per device for the batch-chunked overlap
+    schedule of the fp32-io fast path."""
+    key = dev.index if dev.index is not None else torch.cuda.current_device()
+    pair = _STREAM_PAIR.get(key)
+    if pair is None:
+        pair = (torch.cuda.Stream(device=dev), torch.cuda.Stream(device=dev))
+        _STREAM_PAIR[key] = pair
+    return pair
+
+
+def _fast_fp32_chunk(x, dx, params, fp8w, f, n_heads, hd, scale, eps,
+                     out_y, out_dy):
+    """fp32-io fast pipeline on one batch chunk, writing fp32 y/dy views.
+    fp8 qkv buffer (fp8/fp16-accumulate flash dots), fp16 GEMM outputs,
+    residual adds fused into the RMSNorm2 kernel and the final
+    mixed-dtype adds; the residual stream is stored fp16 (the norm reads
+    the pre-rounding fp32 sum in registers)."""
+    B, S, D = x.shape
+    dev = x.device
+    M = 2 * B * S
+
+    # ---- RMSNorm1: write primal/tangent (fp8) into the stacked buffer
+    xs8 = torch.empty(2 * B, S, D, device=dev, dtype=_FP8)
+    _rmsnorm_jvp(x, dx, params["w_norm1"], xs8[:B], xs8[B:], eps)
+
+    # ---- QKV projection: one fp8 GEMM on the stacked batch, fp8 out
+    qkv = _fp8_mm(xs8.view(M, D), fp8w["w_qkv"], _FP8)
+    qkv = qkv.view(2 * B, S, 3, n_heads, hd)
+    q, k, v = qkv[:B, :, 0], qkv[:B, :, 1], qkv[:B, :, 2]
+    dq, dk, dv = qkv[B:, :, 0], qkv[B:, :, 1], qkv[B:, :, 2]
+
+    # ---- fused flash-attention JVP (fp8 io, fp32 softmax statistics)
+    attn8 = torch.empty(2 * B, S, D, device=dev, dtype=_FP8)
+    _flash_jvp(q, k, v, dq, dk, dv,
+               attn8[:B].view(B, S, n_heads, hd),
+               attn8[B:].view(B, S, n_heads, hd), scale)
+
+    # ---- out projection (fp16 out) + fused residual add + RMSNorm2
+    proj = _fp8_mm(attn8.view(M, D), fp8w["w_out"],
+                   torch.float16).view(2 * B, S, D)
+    res = torch.empty(2 * B, S, D, device=dev, dtype=torch.float16)
+    _rmsnorm_res_jvp(proj[:B], proj[B:], x, dx, params["w_norm2"],
+                     res[:B], res[B:], xs8[:B], xs8[B:], eps)
+
+    # ---- gate/up projection (fp16 out), fused SwiGLU JVP (fp8 out)
+    gu = _fp8_mm(xs8.view(M, D), fp8w["w_gate_up"],
+                 torch.float16).view(2 * B, S, 2 * f)
+    act8 = torch.empty(2 * B, S, f, device=dev, dtype=_FP8)
+    _swiglu_jvp(gu[:B], gu[B:], act8[:B], act8[B:])
+
+    # ---- down projection (fp16 out) + fused mixed-dtype adds
+    dwn = _fp8_mm(act8.view(M, f), fp8w["w_down"],
+                  torch.float16).view(2 * B, S, D)
+    torch.add(dwn[:B], res[:B], out=out_y)
+    torch.add(dwn[B:], res[B:], out=out_dy)
+
+
+def _fast_fp32(x, dx, params, fp8w, f, n_heads, hd, scale, eps):
+    """fp32-io fast path.  For even B the batch is split into two chunks
+    on two CUDA streams (attention is per-batch independent, so chunking
+    is exact — outputs are bit-identical to single-stream): the
+    memory-bound stages of one chunk overlap the tensor-core stages of
+    the other (measured 2.84 -> 2.79 ms at (2, 4096, 768, 12))."""
+    B, S, D = x.shape
+    dev = x.device
+    y = torch.empty(B, S, D, device=dev, dtype=torch.float32)
+    dy = torch.empty(B, S, D, device=dev, dtype=torch.float32)
+    if B >= 2 and B % 2 == 0:
+        half = B // 2
+        cur = torch.cuda.current_stream()
+        ev = torch.cuda.Event()
+        ev.record(cur)
+        for st, sl in zip(_stream_pair(dev),
+                          (slice(0, half), slice(half, B))):
+            st.wait_event(ev)
+            with torch.cuda.stream(st):
+                x.record_stream(st)
+                dx.record_stream(st)
+                _fast_fp32_chunk(x[sl], dx[sl], params, fp8w, f, n_heads,
+                                 hd, scale, eps, y[sl], dy[sl])
+            cur.wait_stream(st)
+    else:
+        _fast_fp32_chunk(x, dx, params, fp8w, f, n_heads, hd, scale, eps,
+                         y, dy)
+    return y, dy
+
+
 def _fp8_weight_cache(params, w_gu):
     return {
         "w_qkv": _fp8_weight(params["w_qkv"]),
@@ -519,6 +683,11 @@ def triton_block_jvp(x, dx, params, eps: float = 1e-6, variant: str = "fast"):
         fp8w = _fp8_weight_cache(params, w_gu)
 
     M = 2 * B * S
+
+    # fp32-io fast path: dedicated pipeline (fp8 flash dots, fp16 GEMM
+    # outputs, fused residual adds, two-stream batch-chunk overlap).
+    if dt == torch.float32:
+        return _fast_fp32(x, dx, params, fp8w, f, n_heads, hd, scale, eps)
 
     # ---- RMSNorm1: write primal/tangent (fp8) into the stacked buffer
     xs8 = torch.empty(2 * B, S, D, device=dev, dtype=_FP8)

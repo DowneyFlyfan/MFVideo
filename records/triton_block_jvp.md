@@ -113,7 +113,7 @@ $$
 
 - API (application programming interface): `triton_block_jvp(x, dx, params, eps, variant)` dispatches on the input dtype — bf16/fp16 inputs take the original path unchanged, fp32 inputs (with fp32-stored params) return fp32 (y, dy) with the internals selected by `variant`: \textbf{fast} (default), \textbf{hp} (high precision, see the dedicated section below), or \textbf{tf32}; `TritonBlockJVP(..., dtype=torch.float32, variant=...)` exposes the same choice, and all pre-existing bf16 call sites keep working without modification
 
-- \textbf{fast} variant internals (io is fp32 but compute is NOT): parameters are stored fp32 and amax-quantized once to fp8 (float8_e4m3fn) for the four linears; RMSNorm1/RMSNorm2 read fp32 and write fp8 directly (the downcast is fused into the existing kernels via a CLAMP constexpr, no separate cast passes); the QKV `torch._scaled_mm` emits fp16 and attention runs the fp16-accumulate flash JVP kernel unchanged; the out, gate-up, and down `torch._scaled_mm` calls emit fp32 directly (out_dtype=fp32 works on sm_120), so the residual stream, the SwiGLU input, and both final outputs are fp32 — accuracy is therefore fp8/fp16-limited, identical in kind to the bf16 path
+- \textbf{fast} variant internals (io is fp32 but compute is NOT; state after the sub-3-ms optimization pass documented in its own section below): parameters are stored fp32 and amax-quantized once to fp8 (float8_e4m3fn) for the four linears; RMSNorm1 reads fp32 and writes fp8 directly (downcast fused via a CLAMP constexpr); the QKV `torch._scaled_mm` emits \textbf{fp8} and attention runs the flash JVP kernel with fp8 operands and fp16-accumulate dots; the out, gate-up, and down `torch._scaled_mm` calls emit fp16; the attention residual add is fused into the RMSNorm2 kernel (which stores an fp16 residual stream computed from the pre-rounding fp32 sum) and the final residual add is a single fused mixed-dtype `torch.add(fp16, fp16, out=fp32)` per output; for even batch the two batch halves run on two CUDA streams (bit-identical outputs); both final outputs are fp32 — accuracy is fp8/fp16-limited, identical in kind to the bf16 path
 
 - \textbf{tf32} variant internals: every buffer is fp32; the same flash/RMSNorm/SwiGLU Triton kernels run with fp32 operands and every `tl.dot` at tf32 inner precision, and the four linears run through cuBLAS with tf32 enabled locally inside the call (`torch.backends.cuda.matmul.fp32_precision` set to "tf32" and restored in a finally block, so the caller's global setting is never changed); no fp8 or fp16 anywhere
 
@@ -125,9 +125,9 @@ $$
 
 | Shape (B, S, D, H) | Variant | y rel Fro | y max abs | dy rel Fro | dy max abs |
 |---|---|---|---|---|---|
-| (2, 512, 768, 12) | fast | 9.818e-03 | 4.826e-02 | 1.400e-02 | 7.302e-02 |
-| (1, 1000, 768, 12) | fast | 9.822e-03 | 4.840e-02 | 1.400e-02 | 7.144e-02 |
-| (2, 4096, 512, 8) | fast | 5.362e-03 | 3.101e-02 | 7.692e-03 | 4.336e-02 |
+| (2, 512, 768, 12) | fast | 9.838e-03 | 4.780e-02 | 1.401e-02 | 8.009e-02 |
+| (1, 1000, 768, 12) | fast | 9.832e-03 | 4.549e-02 | 1.401e-02 | 7.085e-02 |
+| (2, 4096, 512, 8) | fast | 5.373e-03 | 3.050e-02 | 7.699e-03 | 4.167e-02 |
 | (2, 512, 768, 12) | tf32 | 7.785e-05 | 4.050e-04 | 1.111e-04 | 5.524e-04 |
 | (1, 1000, 768, 12) | tf32 | 7.735e-05 | 3.787e-04 | 1.105e-04 | 6.446e-04 |
 | (2, 4096, 512, 8) | tf32 | 4.214e-05 | 2.182e-04 | 6.036e-05 | 3.297e-04 |
@@ -140,13 +140,13 @@ $$
 
 | Shape (B, S, D, H) | fast (ms) | tf32 (ms) | Eager (ms) | Compiled (ms) | fast/eager | fast/comp | tf32/eager | tf32/comp |
 |---|---|---|---|---|---|---|---|---|
-| (2, 1024, 768, 12) | 0.584 | 2.057 | 8.850 | 5.846 | 15.2x | 10.0x | 4.3x | 2.8x |
-| (2, 4096, 768, 12) | 4.006 | 13.795 | 87.451 | 44.432 | 21.8x | 11.1x | 6.3x | 3.2x |
-| (1, 8192, 768, 12) | 6.169 | 21.480 | OOM | 72.910 | n/a | 11.8x | n/a | 3.4x |
+| (2, 1024, 768, 12) | 0.444 | 2.058 | 8.845 | 5.849 | 19.9x | 13.2x | 4.3x | 2.8x |
+| (2, 4096, 768, 12) | 2.732 | 13.794 | 87.472 | 44.609 | 32.0x | 16.3x | 6.3x | 3.2x |
+| (1, 8192, 768, 12) | 4.194 | 21.519 | OOM | 73.079 | n/a | 17.4x | n/a | 3.4x |
 
-- The fast variant clears the 20x goal at (2, 4096, 768, 12): 21.8x versus the fp32 eager baseline; the tf32 variant does NOT reach 20x (6.3x) — its flash kernel is capped by the small shared-memory-viable tiles (single-stage pipelining at (64, 64)) and the tf32 MMA rate, so the higher accuracy costs 3.4x over the fast variant
+- Table state: after the sub-3-ms fast-variant optimization pass (dedicated section below); the fast variant reaches 32.0x versus the fp32 eager baseline at (2, 4096, 768, 12) (the pre-pass value was 4.006 ms = 21.8x); the tf32 variant is unchanged (13.794 ms, 6.3x) — its flash kernel is capped by the small shared-memory-viable tiles (single-stage pipelining at (64, 64)) and the tf32 MMA rate
 
-- fp32 io costs the fast path 0.43 ms over bf16 io at (2, 4096, 768, 12) (4.006 versus 3.572 ms in the same run): the extra traffic is the fp32 residual stream, the fp32 gate/up GEMM output read by SwiGLU, and the fp32 final writes
+- fp32 io is now FASTER than bf16 io on the fast path at (2, 4096, 768, 12) (2.732 versus 3.591 ms in the same run): the fp32 path received the fp8-operand flash dots, the fused residual kernels, and the two-stream overlap, while the bf16 path is intentionally left byte-identical to its recorded 22.8x state
 
 - (1, 8192, 768, 12) eager fp32 baseline: CUDA out of memory on the 16 GB card, the same failure mode as the bf16 eager baseline at that shape
 
@@ -199,5 +199,45 @@ $$
 - Not needed: the planned split-float emulation schemes (3xBF16 hi/lo decomposition, fp16 hi + $2^{11}$-scaled lo correction dots) — plain fp16 storage already lands 22x under the accuracy budget, so spending 2-3x the dot FLOPs on correction terms would buy accuracy that the 3e-3 gate does not require; likewise smem-capped tf32 flash tiles are strictly dominated, since tf32 MMA peaks at 46 TFLOPS on this card versus 138 TFLOPS achieved by the existing fp16-accumulate kernel
 
 - Remaining wall for hp: flash kernel 2.14 ms at 138 TFLOPS (85 percent of the 162-TFLOPS fp16-accumulate ceiling) plus 2.52 ms of cuBLAS fp16 GEMMs at the 92-TFLOPS fp32-accumulate rate; pushing the GEMMs to fp16 accumulation via a custom Triton GEMM (162 TFLOPS ceiling) could save at most about 1.2 ms (5.4 to about 4.2 ms, 18x) and is the next lever if ever required
+
+## fast fp32 Variant Optimization from 4.01 ms to 2.73 ms at (2, 4096, 768, 12)
+
+- Goal: fast fp32-io variant under 3.0 ms at (2, 4096, 768, 12) with the 3e-2 accuracy gate and no bf16/hp/tf32 regression; achieved \textbf{2.732 ms} (30-iteration CUDA-event harness), 32.0x versus the tf32-off fp32 eager `torch.func.jvp` baseline
+
+- MMA (matrix multiply-accumulate) ceilings measured FIRST on this card (4096^3 Triton GEMM, per-tile `tl.dot` in the accumulate dtype + external fp32 cross-tile accumulation — the flash-kernel pattern): fp8e4m3/fp16-accumulate \textbf{212.4} TFLOPS, fp8e4m3/fp32-accumulate 153.2, fp16/fp16-accumulate 147.0, fp16/fp32-accumulate 91.9 — fp8 operands with fp16 accumulation are 1.45x the fp16-operand rate, so the fp8 flash conversion was worth doing despite falling short of the hoped 2x
+
+- Changes, all scoped to the fp32-io fast path (`_fast_fp32` / `_fast_fp32_chunk`; the bf16, hp, and tf32 paths are untouched):
+
+- (1) \textbf{fp8 flash dots}: the QKV `torch._scaled_mm` emits fp8 directly (out_dtype=float8_e4m3fn works on sm_120), the flash JVP kernel loads q/k/v/dq/dk/dv as fp8 and issues all 5 per-tile dots on fp8 operands with `out_dtype=tl.float16`; $\tilde{P}$ and $T$ are cast to fp8 for the value-side dots (`p.to(V.dtype.element_ty)`, so the same kernel body serves fp16 and fp8 io); softmax statistics and cross-tile accumulators stay fp32; a dedicated fp8 autotune space was added and an exhaustive manual sweep (BLOCK_M x BLOCK_N x warps x stages, 70 configs) found \textbf{BLOCK_M = 128, BLOCK_N = 32, 4 warps, 3 stages} at 1.284 ms = \textbf{240.8 TFLOPS} — ABOVE the 4096^3 GEMM microbench rate, because the wide register-resident query tile amortizes all k/dk/v/dv traffic; the autotuner space previously lacked BLOCK_N = 32 and cost 0.32 ms
+
+- (2) \textbf{fused residual + RMSNorm2 kernel} (`_rmsnorm_res_jvp`): the out projection emits fp16, the kernel computes $\mathrm{res} = x + \mathrm{proj}$ (and tangent) in fp32 registers, stores the residual stream in fp16, and applies the RMSNorm JVP to the pre-rounding fp32 sum, storing fp8 for the gate/up GEMM — this removes the two separate residual-add kernels and one full fp32 read/write of the residual stream
+
+- (3) \textbf{fp16 GEMM outputs}: gate/up and down `_scaled_mm` emit fp16 instead of fp32, halving the SwiGLU input traffic (the dominant elementwise stream, 2F = 4096 wide) and the down-projection write; the final residual add is one fused mixed-dtype `torch.add(fp16, fp16, out=fp32)` per output; the fp16 storage rounding (~3e-4 relative) is invisible under the fp8-dominated 1.4e-2 error
+
+- (4) \textbf{two-stream batch-chunk overlap}: for even B the two batch halves run the whole pipeline on two cached CUDA streams (attention is per-batch independent, GEMMs are per-row, norms per-row — chunking is exact and outputs are bit-identical to single-stream, verified max abs diff 0.0); the memory-bound stages of one chunk overlap the tensor-core stages of the other
+
+- Overlap levers measured honestly at (2, 4096, 768, 12) after changes 1-3 (single stream 2.839 ms): lockstep two-stream 2.785 ms (kept), phase-shifted two-stream (stream B waits on stream A's QKV event) 2.804 ms, serialized-flash schedule 2.797 ms; on the PRE-fp8-flash pipeline (3.208 ms) the same levers gave 3.170 / 3.124 / 3.145 ms — overlap contributes only 2-4 percent on this card because the flash kernel and the fp8 GEMMs already saturate the SMs (streaming multiprocessors), and bandwidth interference eats most of the theoretical gain; end-to-end through the module lands at 2.732 ms, 0.09 ms under the serialized stage sum
+
+- NOT used: CUDA graph capture (the two-stream schedule already runs launch-overhead-free — stage sum 2.823 ms versus end-to-end 2.732 ms); custom Triton fp8 GEMMs (the `_scaled_mm` gate/up and down GEMMs measure 210-290 TFLOPS effective, above the 212 TFLOPS Triton fp8/fp16acc microbench ceiling); fp8 gate/up GEMM \textbf{output} (would save ~0.13 ms of SwiGLU traffic but injects ~6 percent relative quantization into the silu argument — unnecessary with the goal already met)
+
+- Per-stage profile at (2, 4096, 768, 12) (CUDA events, 50 iterations, isolated single-stream stage replays on cached buffers; both columns measured in this session on the same card — before = git-HEAD fast path at 4.015 ms end-to-end, after = current code at 2.732 ms end-to-end):
+
+| Stage | Before (ms) | After (ms) |
+|---|---|---|
+| RMSNorm1 JVP | 0.067 | 0.067 |
+| QKV GEMM | 0.273 (fp16 out) | 0.260 (fp8 out) |
+| flash-attention JVP | 2.197 (fp16 dots) | 1.297 (fp8 dots, 240 TFLOPS) |
+| out GEMM | 0.083 (fp32 out) | 0.094 (fp16 out) |
+| residual adds + RMSNorm2 | 0.191 + 0.067 | 0.141 (one fused kernel) |
+| gate/up GEMM | 0.473 (fp32 out) | 0.461 (fp16 out) |
+| SwiGLU JVP | 0.375 (fp32 in) | 0.201 (fp16 in) |
+| down GEMM | 0.179 (fp32 out) | 0.171 (fp16 out) |
+| final residual add | 0.191 | 0.131 (fused mixed-dtype) |
+| stage sum | 4.097 | 2.823 |
+| end-to-end | 4.015 (single stream) | \textbf{2.732} (two-stream) |
+
+- Accuracy after all changes (fp64 `torch.func.jvp` reference, threshold 3e-2): dy rel Fro 1.401e-02 at (2, 512, 768, 12) and (1, 1000, 768, 12), 7.699e-03 at (2, 4096, 512, 8) — statistically unchanged from the pre-pass 1.400e-02 / 7.692e-03 (fp8 weight quantization still dominates; the fp8 score/value quantization in attention is invisible at this level); all 13 pytest cases pass
+
+- No-regression check in the same run: bf16 3.591 ms (recorded 3.575 ms, within run-to-run noise), hp 5.384 ms (recorded 5.388 ms), tf32 13.794 ms (recorded 13.795 ms); hp/tf32/bf16 correctness errors bit-for-bit at their recorded values
 
 - Repro: `/opt/miniconda3/bin/python3 tests/test_triton_block_jvp.py` (correctness then benchmark), or `python3 -m pytest tests/test_triton_block_jvp.py` for correctness only

@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
-from imf_video_pt import IMFVideoLoss
+from imf_video import IMFVideoLoss
 from models.imf_dit_video import imf_dit_video_S
 
 

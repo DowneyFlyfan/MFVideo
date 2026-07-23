@@ -19,7 +19,7 @@ def main():
     import models.attention_op as attention_op
     import models.flash_jvp_kernel as flash_jvp_kernel
     from models.imf_dit_video import imf_dit_video_S
-    from imf_video_pt import IMFVideoLoss
+    from imf_video import IMFVideoLoss
 
     counts = {"fused_jvp": 0, "fa4_fwd": 0, "fa4_bwd": 0}
 
