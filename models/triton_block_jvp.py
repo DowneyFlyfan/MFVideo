@@ -6,16 +6,23 @@ Block: x -> RMSNorm1 -> QKV linear -> multi-head attention -> out linear
          -> +residual -> RMSNorm2 -> SwiGLU MLP -> +residual
 
 Because parameter tangents are zero, every linear layer applies the SAME
-weight to primal and tangent, so each linear runs as ONE cuBLAS GEMM
-(general matrix multiplication) on the stacked batch [x; dx] of shape
-(2B, S, D).  Triton kernels handle the three nonlinear ops, each fused
-to produce primal and tangent in a single pass:
+weight to primal and tangent, so each linear runs as ONE GEMM (general
+matrix multiplication) on the stacked batch [x; dx] of shape (2B, S, D).
 
-  1. RMSNorm JVP     (one read of x, dx -> y, dy)
-  2. flash-attention JVP (online softmax, o and do in one kernel)
-  3. SwiGLU JVP      (elementwise, h and dh in one kernel)
+Speed path (sm_89+, torch._scaled_mm available):
+  * All four linears run in fp8 (float8_e4m3fn) tensor cores via
+    torch._scaled_mm with per-tensor scales: weights are amax-scaled to
+    the fp8 range once and cached; activations are quantized to fp8
+    *inside the producing Triton kernel* (RMSNorm JVP, flash JVP,
+    SwiGLU JVP) with unit scale, so quantization costs no extra pass.
+  * The flash-attention JVP kernel takes fp16 q/k/v (the QKV GEMM emits
+    fp16 directly) and issues all tl.dot ops with fp16 accumulation
+    (2x MMA rate on GeForce), accumulating across key tiles in fp32 so
+    per-element error stays at the fp16 per-tile level.  The two
+    tangent-score dots dQ K^T + Q dK^T are merged into a single dot of
+    inner width 2*head_dim via tl.join interleaving.
 
-All io is bf16 (or fp16); all accumulation/statistics are fp32.
+All softmax statistics and cross-tile accumulation are fp32.
 """
 
 import math
@@ -27,6 +34,36 @@ import triton.language as tl
 
 __all__ = ["triton_block_jvp", "TritonBlockJVP", "ffn_dim", "init_block_params"]
 
+_FP8 = torch.float8_e4m3fn
+_FP8_MAX = 448.0
+_ONES = {}
+
+
+def _one(dev):
+    t = _ONES.get(dev)
+    if t is None:
+        t = torch.ones(1, device=dev, dtype=torch.float32)
+        _ONES[dev] = t
+    return t
+
+
+def _fp8_weight(w):
+    """Quantize a weight matrix to fp8 with a per-tensor amax scale.
+    Returns (w8, descale) with w ~= w8 * descale."""
+    amax = w.detach().abs().amax().float().clamp_min(1e-12)
+    descale = (amax / _FP8_MAX).reshape(1)
+    w8 = (w.detach().float() / descale).clamp_(-_FP8_MAX, _FP8_MAX).to(_FP8)
+    return w8, descale
+
+
+def _fp8_mm(a8, w8_descale, out_dtype):
+    """(M, K) fp8 row-major @ cached fp8 weight (N, K) -> (M, N)."""
+    w8, descale = w8_descale
+    return torch._scaled_mm(
+        a8, w8.t(), scale_a=_one(a8.device), scale_b=descale,
+        out_dtype=out_dtype,
+    )
+
 
 def ffn_dim(d_model: int) -> int:
     """SwiGLU hidden width: 8*d/3 rounded to a multiple of 64."""
@@ -36,6 +73,7 @@ def ffn_dim(d_model: int) -> int:
 # --------------------------------------------------------------------------
 # RMSNorm JVP:  r = sqrt(mean(x^2)+eps);  y = w*x/r
 #               dy = w*(dx/r - x*mean(x*dx)/r^3)
+# Outputs are stored in fp8 (unit scale) as input to the following GEMM.
 # --------------------------------------------------------------------------
 @triton.jit
 def _rmsnorm_jvp_kernel(X, DX, W, Y, DY, D, eps, BLOCK: tl.constexpr):
@@ -49,6 +87,8 @@ def _rmsnorm_jvp_kernel(X, DX, W, Y, DY, D, eps, BLOCK: tl.constexpr):
     mxdx = tl.sum(x * dx, axis=0) / D
     y = w * x * inv_r
     dy = w * (dx * inv_r - x * (mxdx * inv_r * inv_r * inv_r))
+    y = tl.clamp(y, -448.0, 448.0)
+    dy = tl.clamp(dy, -448.0, 448.0)
     tl.store(Y + row * D + cols, y.to(Y.dtype.element_ty), mask=mask)
     tl.store(DY + row * D + cols, dy.to(DY.dtype.element_ty), mask=mask)
 
@@ -65,20 +105,24 @@ def _rmsnorm_jvp(x, dx, w, y, dy, eps):
 # --------------------------------------------------------------------------
 # Flash-attention JVP.  Per (m, n) tile, with softmax scale c:
 #   S  = c * Q K^T                    (kept in log2 units for exp2)
-#   dS = c * (dQ K^T + Q dK^T)        (natural units)
+#   dS = c * (dQ K^T + Q dK^T)        (one dot over width 2*hd, joined)
 #   Ptil = exp(S - m)   (running max m; the m-shift cancels exactly in JVP)
 #   T  = Ptil * dS
 #   acc_o += Ptil @ V;  acc_do += T @ V + Ptil @ dV
 #   l += rowsum(Ptil);  mu += rowsum(T);  rescale all on max update
 #   o = acc_o/l;  do = acc_do/l - (mu/l)*o
+# q/k/v are fp16; every tl.dot uses fp16 accumulation (per tile), the
+# cross-tile accumulators are fp32.  o/do are stored in fp8.
 # --------------------------------------------------------------------------
 _FLASH_CONFIGS = [
     triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2),
     triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=2),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=2),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=3),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=3),
+    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=3),
     triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=2),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=3),
 ]
 
 
@@ -112,6 +156,8 @@ def _flash_jvp_kernel(
     else:
         q = tl.load(Q + qp, mask=mask_m[:, None], other=0.0)
         dq = tl.load(DQ + qp, mask=mask_m[:, None], other=0.0)
+    # interleaved [dq|q] so one dot of width 2*hd gives dQ K^T + Q dK^T
+    qj = tl.reshape(tl.join(dq, q), (BLOCK_M, 2 * HEAD_DIM))
 
     m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
@@ -132,13 +178,17 @@ def _flash_jvp_kernel(
             mask_n = offs < S
             k = tl.load(K + kp, mask=mask_n[:, None], other=0.0)
             dk = tl.load(DK + kp, mask=mask_n[:, None], other=0.0)
+        kj = tl.reshape(tl.join(k, dk), (BLOCK_N, 2 * HEAD_DIM))
 
-        s_raw = tl.dot(q, tl.trans(k))
-        ds = (tl.dot(dq, tl.trans(k)) + tl.dot(q, tl.trans(dk))) * scale
+        s16 = tl.dot(q, tl.trans(k), out_dtype=tl.float16)
+        ds16 = tl.dot(qj, tl.trans(kj), out_dtype=tl.float16)
+        ds = ds16.to(tl.float32) * scale
         if EVEN_S:
-            s2 = s_raw * qk_scale
+            s2 = s16.to(tl.float32) * qk_scale
         else:
-            s2 = tl.where(mask_n[None, :], s_raw * qk_scale, float("-inf"))
+            s2 = tl.where(
+                mask_n[None, :], s16.to(tl.float32) * qk_scale, float("-inf")
+            )
 
         m_new = tl.maximum(m_i, tl.max(s2, 1))
         alpha = tl.math.exp2(m_i - m_new)
@@ -154,14 +204,19 @@ def _flash_jvp_kernel(
         else:
             v = tl.load(V + kp, mask=mask_n[:, None], other=0.0)
             dv = tl.load(DV + kp, mask=mask_n[:, None], other=0.0)
-        pc = p.to(Q.dtype.element_ty)
-        tc = t.to(Q.dtype.element_ty)
-        acc_o = acc_o * alpha[:, None] + tl.dot(pc, v)
-        acc_do = acc_do * alpha[:, None] + tl.dot(tc, v) + tl.dot(pc, dv)
+        pc = p.to(tl.float16)
+        tc = t.to(tl.float16)
+        o_t = tl.dot(pc, v, out_dtype=tl.float16)
+        do_t = (tl.dot(tc, v, out_dtype=tl.float16)
+                + tl.dot(pc, dv, out_dtype=tl.float16))
+        acc_o = acc_o * alpha[:, None] + o_t.to(tl.float32)
+        acc_do = acc_do * alpha[:, None] + do_t.to(tl.float32)
         m_i = m_new
 
     o = acc_o / l_i[:, None]
     do = acc_do / l_i[:, None] - (mu_i / l_i)[:, None] * o
+    o = tl.clamp(o, -448.0, 448.0)
+    do = tl.clamp(do, -448.0, 448.0)
 
     op = b * s_ob + h * s_oh + offs_m[:, None] * s_os + offs_d[None, :]
     if EVEN_S:
@@ -192,7 +247,7 @@ def _flash_jvp(q, k, v, dq, dk, dv, o, do, scale):
 # SwiGLU JVP:  h = silu(g)*u
 #              dh = silu'(g)*dg*u + silu(g)*du
 #              silu'(g) = sigmoid(g)*(1 + g*(1 - sigmoid(g)))
-# GU rows are [gate | up] of width 2F; outputs are contiguous width F.
+# GU rows are [gate | up] of width 2F; outputs (fp8) are width F.
 # --------------------------------------------------------------------------
 @triton.jit
 def _swiglu_jvp_kernel(GU, DGU, Hout, DHout, F, total, BLOCK: tl.constexpr):
@@ -208,8 +263,8 @@ def _swiglu_jvp_kernel(GU, DGU, Hout, DHout, F, total, BLOCK: tl.constexpr):
     sig = tl.sigmoid(g)
     silu = g * sig
     dsilu = sig * (1.0 + g * (1.0 - sig))
-    h = silu * u
-    dh = dsilu * dg * u + silu * du
+    h = tl.clamp(silu * u, -448.0, 448.0)
+    dh = tl.clamp(dsilu * dg * u + silu * du, -448.0, 448.0)
     tl.store(Hout + i, h.to(Hout.dtype.element_ty), mask=mask)
     tl.store(DHout + i, dh.to(DHout.dtype.element_ty), mask=mask)
 
@@ -226,6 +281,15 @@ def _swiglu_jvp(gu, dgu, h, dh):
 # --------------------------------------------------------------------------
 # Full block JVP
 # --------------------------------------------------------------------------
+def _fp8_weight_cache(params, w_gu):
+    return {
+        "w_qkv": _fp8_weight(params["w_qkv"]),
+        "w_out": _fp8_weight(params["w_out"]),
+        "w_gate_up": _fp8_weight(w_gu),
+        "w_down": _fp8_weight(params["w_down"]),
+    }
+
+
 def triton_block_jvp(x, dx, params, eps: float = 1e-6):
     """Forward-mode JVP of the transformer block w.r.t. the input only.
 
@@ -233,7 +297,9 @@ def triton_block_jvp(x, dx, params, eps: float = 1e-6):
     params: dict with keys w_norm1 (D,), w_qkv (3D, D), w_out (D, D),
             w_norm2 (D,), w_gate (F, D), w_up (F, D), w_down (D, F),
             n_heads (int).  Optional key w_gate_up (2F, D) = cat(gate, up)
-            avoids a per-call concatenation.
+            avoids a per-call concatenation; optional key _fp8 (the dict
+            built by _fp8_weight_cache) avoids per-call weight
+            quantization.
     Returns (y, dy), each (B, S, D).
     """
     assert x.is_cuda and x.is_contiguous() and dx.is_contiguous()
@@ -249,41 +315,45 @@ def triton_block_jvp(x, dx, params, eps: float = 1e-6):
         w_gu = torch.cat([params["w_gate"], params["w_up"]], dim=0)
     f = w_gu.shape[0] // 2
 
-    # ---- RMSNorm1: write primal/tangent straight into the stacked buffer
-    xs = torch.empty(2 * B, S, D, device=dev, dtype=dt)
-    _rmsnorm_jvp(x, dx, params["w_norm1"], xs[:B], xs[B:], eps)
+    fp8w = params.get("_fp8")
+    if fp8w is None:
+        fp8w = _fp8_weight_cache(params, w_gu)
 
-    # ---- QKV projection: one GEMM on the stacked batch
-    qkv = torch.matmul(xs.view(2 * B * S, D), params["w_qkv"].t())
+    M = 2 * B * S
+
+    # ---- RMSNorm1: write primal/tangent (fp8) into the stacked buffer
+    xs8 = torch.empty(2 * B, S, D, device=dev, dtype=_FP8)
+    _rmsnorm_jvp(x, dx, params["w_norm1"], xs8[:B], xs8[B:], eps)
+
+    # ---- QKV projection: one fp8 GEMM on the stacked batch, fp16 out
+    qkv = _fp8_mm(xs8.view(M, D), fp8w["w_qkv"], torch.float16)
     qkv = qkv.view(2 * B, S, 3, n_heads, hd)
     q, k, v = qkv[:B, :, 0], qkv[:B, :, 1], qkv[:B, :, 2]
     dq, dk, dv = qkv[B:, :, 0], qkv[B:, :, 1], qkv[B:, :, 2]
 
-    # ---- fused flash-attention JVP, o/do written into a stacked buffer
-    attn = torch.empty(2 * B, S, D, device=dev, dtype=dt)
+    # ---- fused flash-attention JVP, o/do written (fp8) into a buffer
+    attn8 = torch.empty(2 * B, S, D, device=dev, dtype=_FP8)
     _flash_jvp(q, k, v, dq, dk, dv,
-               attn[:B].view(B, S, n_heads, hd),
-               attn[B:].view(B, S, n_heads, hd), scale)
+               attn8[:B].view(B, S, n_heads, hd),
+               attn8[B:].view(B, S, n_heads, hd), scale)
 
-    # ---- out projection (stacked GEMM) + residual add
-    res = torch.matmul(attn.view(2 * B * S, D), params["w_out"].t())
-    res = res.view(2 * B, S, D)
+    # ---- out projection (stacked fp8 GEMM) + residual add
+    res = _fp8_mm(attn8.view(M, D), fp8w["w_out"], dt).view(2 * B, S, D)
     res[:B] += x
     res[B:] += dx
 
-    # ---- RMSNorm2 (reuse xs as the stacked normed buffer)
-    _rmsnorm_jvp(res[:B], res[B:], params["w_norm2"], xs[:B], xs[B:], eps)
+    # ---- RMSNorm2 (reuse xs8 as the stacked normed fp8 buffer)
+    _rmsnorm_jvp(res[:B], res[B:], params["w_norm2"], xs8[:B], xs8[B:], eps)
 
-    # ---- gate/up projection: one GEMM on stacked batch, fused weight
-    gu = torch.matmul(xs.view(2 * B * S, D), w_gu.t()).view(2 * B, S, 2 * f)
+    # ---- gate/up projection: one fp8 GEMM on stacked batch, fused weight
+    gu = _fp8_mm(xs8.view(M, D), fp8w["w_gate_up"], dt).view(2 * B, S, 2 * f)
 
-    # ---- fused SwiGLU JVP into a stacked buffer
-    act = torch.empty(2 * B, S, f, device=dev, dtype=dt)
-    _swiglu_jvp(gu[:B], gu[B:], act[:B], act[B:])
+    # ---- fused SwiGLU JVP into a stacked fp8 buffer
+    act8 = torch.empty(2 * B, S, f, device=dev, dtype=_FP8)
+    _swiglu_jvp(gu[:B], gu[B:], act8[:B], act8[B:])
 
-    # ---- down projection (stacked GEMM) + residual add
-    out = torch.matmul(act.view(2 * B * S, f), params["w_down"].t())
-    out = out.view(2 * B, S, D)
+    # ---- down projection (stacked fp8 GEMM) + residual add
+    out = _fp8_mm(act8.view(M, f), fp8w["w_down"], dt).view(2 * B, S, D)
     out += res
     return out[:B].contiguous(), out[B:].contiguous()
 
@@ -316,7 +386,8 @@ def init_block_params(d_model, n_heads, device="cuda", dtype=torch.bfloat16,
 
 class TritonBlockJVP(nn.Module):
     """Module wrapper holding the block parameters (same init as the
-    PyTorch reference).  forward(x, dx) -> (y, dy)."""
+    PyTorch reference).  forward(x, dx) -> (y, dy).  Caches the fused
+    gate/up weight and the fp8-quantized weights across calls."""
 
     def __init__(self, d_model, n_heads, device="cuda",
                  dtype=torch.bfloat16, eps=1e-6, seed=0):
@@ -328,6 +399,7 @@ class TritonBlockJVP(nn.Module):
                      "w_gate", "w_up", "w_down"):
             setattr(self, name, nn.Parameter(p[name]))
         self._w_gate_up = None
+        self._fp8 = None
 
     def load_params(self, params):
         with torch.no_grad():
@@ -335,16 +407,22 @@ class TritonBlockJVP(nn.Module):
                          "w_gate", "w_up", "w_down"):
                 getattr(self, name).copy_(params[name])
         self._w_gate_up = None
+        self._fp8 = None
 
     def forward(self, x, dx):
         if self._w_gate_up is None or self._w_gate_up.dtype != x.dtype:
             self._w_gate_up = torch.cat(
                 [self.w_gate.detach(), self.w_up.detach()], dim=0)
+            self._fp8 = None
+        if self._fp8 is None:
+            self._fp8 = _fp8_weight_cache(
+                {"w_qkv": self.w_qkv, "w_out": self.w_out,
+                 "w_down": self.w_down}, self._w_gate_up)
         params = {
             "w_norm1": self.w_norm1, "w_qkv": self.w_qkv,
             "w_out": self.w_out, "w_norm2": self.w_norm2,
             "w_gate": self.w_gate, "w_up": self.w_up,
             "w_down": self.w_down, "w_gate_up": self._w_gate_up,
-            "n_heads": self.n_heads,
+            "_fp8": self._fp8, "n_heads": self.n_heads,
         }
         return triton_block_jvp(x, dx, params, eps=self.eps)
